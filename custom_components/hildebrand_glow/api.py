@@ -2,12 +2,16 @@
 from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 import aiohttp
 from aiohttp import ClientError, ClientResponseError
 from .const import GLOWMARKT_API_BASE, GLOWMARKT_APP_ID
 
 _LOGGER = logging.getLogger(__name__)
+
+# UK timezone for proper day boundaries
+UK_TZ = ZoneInfo("Europe/London")
 
 class GlowmarktAuthError(Exception):
     """Exception for authentication errors."""
@@ -39,6 +43,7 @@ class GlowmarktApiClient:
                 if data.get("valid"):
                     self._token = data["token"]
                     self._token_expiry = datetime.now() + timedelta(days=6)
+                    _LOGGER.debug("Authentication successful, token expires in 6 days")
                     return True
                 else:
                     raise GlowmarktAuthError("Authentication failed: invalid response")
@@ -85,6 +90,7 @@ class GlowmarktApiClient:
                         classifier = resource.get("classifier")
                         if resource_id and classifier:
                             self._resources[classifier] = {"resource_id": resource_id, "name": resource.get("name", classifier), "classifier": classifier, "base_unit": resource.get("baseUnit", "")}
+                            _LOGGER.debug("Found resource: %s (%s)", classifier, resource_id)
             except ClientError as err:
                 _LOGGER.error("Failed to get resources for %s: %s", ve_id, err)
         return self._resources
@@ -94,32 +100,67 @@ class GlowmarktApiClient:
         await self._ensure_authenticated()
         
         # Use UK timezone for proper day boundaries
-        now = datetime.now(timezone.utc)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        now_uk = datetime.now(UK_TZ)
+        today_start_uk = now_uk.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Convert to UTC for API call (API expects UTC)
+        today_start_utc = today_start_uk.astimezone(timezone.utc)
+        now_utc = now_uk.astimezone(timezone.utc)
+        
+        _LOGGER.debug(
+            "Fetching readings for %s from %s to %s (UK: %s to %s)",
+            resource_id,
+            today_start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+            now_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+            today_start_uk.strftime("%Y-%m-%d %H:%M"),
+            now_uk.strftime("%H:%M")
+        )
         
         try:
             # Fetch 30-minute interval data for today and sum it
+            params = {
+                "from": today_start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+                "to": now_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+                "period": "PT30M",
+                "offset": 0,
+                "function": "sum"
+            }
+            _LOGGER.debug("API params: %s", params)
+            
             async with self._session.get(
                 f"{GLOWMARKT_API_BASE}/resource/{resource_id}/readings",
                 headers=self._get_headers(),
-                params={
-                    "from": today_start.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "to": now.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "period": "PT30M",
-                    "offset": 0,
-                    "function": "sum"
-                }
+                params=params
             ) as response:
                 response.raise_for_status()
                 data = await response.json()
-                _LOGGER.debug("API response for %s: %s", resource_id, data)
+                
+                _LOGGER.debug("API response status: %s, data points: %s", 
+                    data.get("status"), 
+                    len(data.get("data", [])) if data.get("data") else 0
+                )
                 
                 if data.get("status") == "OK" and data.get("data"):
+                    readings = data["data"]
+                    # Log each reading for debugging
+                    for reading in readings[-5:]:  # Log last 5 readings
+                        ts = datetime.fromtimestamp(reading[0], tz=UK_TZ).strftime("%H:%M")
+                        val = reading[1]
+                        _LOGGER.debug("  %s: %s kWh", ts, val)
+                    
                     # Sum all the 30-minute readings
-                    total = sum(reading[1] for reading in data["data"] if reading[1] is not None)
-                    _LOGGER.debug("Summed %d readings for %s: %.3f", len(data["data"]), resource_id, total)
+                    total = sum(reading[1] for reading in readings if reading[1] is not None)
+                    _LOGGER.info("Resource %s: summed %d readings = %.3f kWh", 
+                        resource_id, len(readings), total)
                     return round(total, 3)
-                return 0.0
+                else:
+                    _LOGGER.warning("No data returned for %s. Status: %s, Response: %s", 
+                        resource_id, data.get("status"), data)
+                    return None  # Return None instead of 0 when no data
+                    
+        except ClientResponseError as err:
+            _LOGGER.error("API error for %s: %s %s", resource_id, err.status, err.message)
+            return None
         except ClientError as err:
             _LOGGER.error("Failed to get reading for %s: %s", resource_id, err)
             return None
